@@ -17,6 +17,8 @@ from mlflow.models.signature import infer_signature
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.tree import DecisionTreeRegressor
+from sklearn.model_selection import GridSearchCV
+
 
 
 
@@ -25,6 +27,53 @@ GLOBAL_MODEL_OBJECTS = {}  #for registering best model to mlflow automatically
 
 
 matplotlib.use("Agg")   # non-GUI backend
+
+matplotlib.use("Agg")   # non-GUI backend
+
+# ================= TIME SERIES CROSS VALIDATION =================
+from sklearn.model_selection import TimeSeriesSplit
+
+def time_series_cv_evaluate(
+    model,
+    X,
+    y,
+    n_splits=5,
+    model_name="Model"
+):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
+    rmse_scores = []
+    mae_scores = []
+    r2_scores = []
+
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
+        X_train_cv, X_val_cv = X.iloc[train_idx], X.iloc[val_idx]
+        y_train_cv, y_val_cv = y.iloc[train_idx], y.iloc[val_idx]
+
+        model.fit(X_train_cv, y_train_cv)
+        preds = model.predict(X_val_cv)
+
+        rmse = np.sqrt(mean_squared_error(y_val_cv, preds))
+        mae  = mean_absolute_error(y_val_cv, preds)
+        r2   = r2_score(y_val_cv, preds)
+
+        rmse_scores.append(rmse)
+        mae_scores.append(mae)
+        r2_scores.append(r2)
+
+        print(
+            f"{model_name} | Fold {fold+1} | "
+            f"RMSE={rmse:.3f}, MAE={mae:.3f}, R2={r2:.3f}"
+        )
+
+    return {
+        "rmse_mean": float(np.mean(rmse_scores)),
+        "rmse_std": float(np.std(rmse_scores)),
+        "mae_mean": float(np.mean(mae_scores)),
+        "r2_mean": float(np.mean(r2_scores))
+    }
+# ================================================================
+
 
 
 
@@ -288,6 +337,19 @@ print("Training records:", len(train_df))
 print("Validation records:", len(val_df))
 print("Testing records:", len(test_df))
 
+# ---------------- SPLIT PERCENTAGES ----------------
+
+total_records = len(train_df) + len(val_df) + len(test_df)
+
+train_pct = (len(train_df) / total_records) * 100
+val_pct   = (len(val_df) / total_records) * 100
+test_pct  = (len(test_df) / total_records) * 100
+
+print("\nDataset Split Percentage:")
+print(f"Training     : {train_pct:.2f}%")
+print(f"Validation   : {val_pct:.2f}%")
+print(f"Testing      : {test_pct:.2f}%")
+
 #----------------------------------------------------------------------------
 
 
@@ -378,7 +440,9 @@ X_test_scaled.to_csv("X_test_scaled.csv", index=False)
 
 
 
+
 #------------------------add metadata--------------------------------------
+
 
 metadata = {
     "features": list(X_train_scaled.columns),
@@ -393,12 +457,182 @@ os.makedirs(FEATURE_STORE_DIR, exist_ok=True)
 with open("feature_store/metadata.json", "w") as f:
     json.dump(metadata, f, indent=4)
 print("Feature store metadata saved successfully")
+#----------------------------------------------------------------------------
+
+# TRAIN LINEAR REGRESSION
+lr_model = LinearRegression()
+lr_model.fit(X_train_scaled, y_train)
+
+
+
+# ================= CROSS VALIDATION =================
+
+lr_cv_results = time_series_cv_evaluate(
+    LinearRegression(),
+    X_train_scaled,
+    y_train,
+    n_splits=5,
+    model_name="LinearRegression"
+)
+
+dt_cv_results = time_series_cv_evaluate(
+    DecisionTreeRegressor(
+        max_depth=12,
+        min_samples_leaf=20,
+        random_state=42
+    ),
+    X_train_scaled,
+    y_train,
+    n_splits=5,
+    model_name="DecisionTree"
+)
+
+rf_cv_results = time_series_cv_evaluate(
+    RandomForestRegressor(
+        n_estimators=100,
+        max_depth=15,
+        random_state=42,
+        n_jobs=-1
+    ),
+    X_train_scaled,
+    y_train,
+    n_splits=5,
+    model_name="RandomForest"
+)
+
+xgb_cv_results = time_series_cv_evaluate(
+    XGBRegressor(
+        n_estimators=300,
+        learning_rate=0.05,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective="reg:squarederror",
+        random_state=42,
+        n_jobs=-1
+    ),
+    X_train_scaled,
+    y_train,
+    n_splits=5,
+    model_name="XGBoost"
+)
+
+# ================= HYPERPARAMETER TUNING : LINEAR REGRESSION =================
+
+lr_param_grid = {
+    "fit_intercept": [True, False],
+    "positive": [False, True]
+}
+
+lr_grid = GridSearchCV(
+    estimator=LinearRegression(),
+    param_grid=lr_param_grid,
+    scoring="neg_root_mean_squared_error",
+    cv=TimeSeriesSplit(n_splits=5),
+    n_jobs=-1
+)
+
+lr_grid.fit(X_train_scaled, y_train)
+
+best_lr_model = lr_grid.best_estimator_
+
+print("\nBest Linear Regression Parameters:")
+print(lr_grid.best_params_)
+print("Best Linear Regression RMSE:", -lr_grid.best_score_)
+
+evaluate_global_model("LinearRegression", lr_model, X_test_scaled, y_test)
+
+# ================= HYPERPARAMETER TUNING : DECISION TREE =================
+
+dt_param_grid = {
+    "max_depth": [6, 10, 15, 20],
+    "min_samples_leaf": [5, 10, 20, 40],
+    "min_samples_split": [2, 5, 10]
+}
+
+dt_grid = GridSearchCV(
+    estimator=DecisionTreeRegressor(random_state=42),
+    param_grid=dt_param_grid,
+    scoring="neg_root_mean_squared_error",
+    cv=TimeSeriesSplit(n_splits=5),
+    n_jobs=-1
+)
+
+dt_grid.fit(X_train_scaled, y_train)
+
+best_dt_model = dt_grid.best_estimator_
+
+print("\nBest Decision Tree Params:")
+print(dt_grid.best_params_)
+print("Best DT RMSE:", -dt_grid.best_score_)
+
+# ================= HYPERPARAMETER TUNING : XGBOOST =================
+
+xgb_param_grid = {
+    "n_estimators": [200, 300],
+    "max_depth": [4, 6, 8],
+    "learning_rate": [0.03, 0.05, 0.1],
+    "subsample": [0.7, 0.8],
+    "colsample_bytree": [0.7, 0.8]
+}
+
+xgb_grid = GridSearchCV(
+    estimator=XGBRegressor(
+        objective="reg:squarederror",
+        random_state=42,
+        n_jobs=-1
+    ),
+    param_grid=xgb_param_grid,
+    scoring="neg_root_mean_squared_error",
+    cv=TimeSeriesSplit(n_splits=5),
+    n_jobs=-1
+)
+
+xgb_grid.fit(X_train_scaled, y_train)
+
+best_xgb_model = xgb_grid.best_estimator_
+
+print("\nBest XGBoost Params:")
+print(xgb_grid.best_params_)
+print("Best XGB RMSE:", -xgb_grid.best_score_)
+
+# ================= HYPERPARAMETER TUNING : RANDOM FOREST =================
+
+rf_param_grid = {
+    "n_estimators": [100, 200],
+    "max_depth": [10, 15, 20],
+    "min_samples_leaf": [5, 10, 20]
+}
+
+rf_grid = GridSearchCV(
+    estimator=RandomForestRegressor(random_state=42, n_jobs=-1),
+    param_grid=rf_param_grid,
+    scoring="neg_root_mean_squared_error",
+    cv=TimeSeriesSplit(n_splits=5),
+    n_jobs=-1
+)
+
+rf_grid.fit(X_train_scaled, y_train)
+
+best_rf_model = rf_grid.best_estimator_
+
+print("\nBest Random Forest Params:")
+print(rf_grid.best_params_)
+print("Best RF RMSE:", -rf_grid.best_score_)
+
 
 #----------------------------------------------------------------------------
 
 # TRAIN LINEAR REGRESSION
 lr_model = LinearRegression()
 lr_model.fit(X_train_scaled, y_train)
+
+#----------------------------------------------------------------------------
+
+# TRAIN LINEAR REGRESSION
+lr_model = LinearRegression()
+lr_model.fit(X_train_scaled, y_train)
+
 
 
 # Ask user for city
@@ -1437,6 +1671,13 @@ save_inference_artifacts(
     base_dir=ARTIFACT_DIR)
 
 print("Inference artifacts saved successfully.")
+
+
+
+
+
+
+
 
 
 
